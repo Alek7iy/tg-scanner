@@ -15,7 +15,6 @@ object ExcelReportService {
         val workbook = XSSFWorkbook()
         val sheet = workbook.createSheet("Оборудование")
 
-        // Стиль для заголовков
         val headerFont = workbook.createFont().apply {
             bold = true
             color = IndexedColors.WHITE.index
@@ -26,13 +25,17 @@ object ExcelReportService {
             fillPattern = FillPatternType.SOLID_FOREGROUND
         }
 
-        // Заголовки без столбца "Сырые данные"
         val headers = listOf(
             "№",
             "Дата/Время",
             "Тип",
-            "Производитель",
-            "Модель",
+            "Мастерская/Производитель",
+            "Модель / Тахограф",
+            "VIN",
+            "Госномер (VRN)",
+            "C/N / S/N",
+            "НКМ (СКЗИ)",
+            "MAC (ДУТ)",
             "IMEI",
             "Номер телефона",
             "ICCID"
@@ -45,7 +48,6 @@ object ExcelReportService {
             cell.cellStyle = headerStyle
         }
 
-        // Заполнение строк
         records.forEachIndexed { index, record ->
             val row = sheet.createRow(index + 1)
             row.createCell(0).setCellValue((index + 1).toDouble())
@@ -53,12 +55,16 @@ object ExcelReportService {
             row.createCell(2).setCellValue(record.objectType.title)
             row.createCell(3).setCellValue(record.manufacturer)
             row.createCell(4).setCellValue(record.model)
-            row.createCell(5).setCellValue(record.imei)
-            row.createCell(6).setCellValue(record.phoneNumber)
-            row.createCell(7).setCellValue(record.iccid)
+            row.createCell(5).setCellValue(record.vin)
+            row.createCell(6).setCellValue(record.vrn)
+            row.createCell(7).setCellValue(record.serialNumber)
+            row.createCell(8).setCellValue(record.nkm)
+            row.createCell(9).setCellValue(record.macAddress)
+            row.createCell(10).setCellValue(record.imei)
+            row.createCell(11).setCellValue(record.phoneNumber)
+            row.createCell(12).setCellValue(record.iccid)
         }
 
-        // Автоширина для всех 8 столбцов
         for (i in headers.indices) {
             sheet.autoSizeColumn(i)
         }

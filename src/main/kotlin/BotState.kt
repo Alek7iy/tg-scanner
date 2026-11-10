@@ -2,16 +2,18 @@ package com.example
 
 enum class EditField {
     MODEL,
-    IDENTIFIER, // IMEI или телефон/ICCID
+    IDENTIFIER,
     MANUFACTURER,
-    DUT_MODEL,   // ESCORT TD BLE
-    DUT_SERIAL,  // серийный номер ДУТ
-    DUT_MAC      // MAC-адрес
+    DUT_SERIAL,
+    DUT_MAC,
+    VIN,
+    VRN,
+    NKM
 }
-
 
 data class UserInputState(
     val recordId: String,
-    val field: EditField
+    val field: EditField,
+    val cardMessageId: Int? = null
 )
 

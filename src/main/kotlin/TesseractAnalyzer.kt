@@ -1,282 +1,278 @@
 package com.example
 
-import com.google.zxing.BarcodeFormat
-import com.google.zxing.BinaryBitmap
-import com.google.zxing.DecodeHintType
-import com.google.zxing.MultiFormatReader
-import com.google.zxing.client.j2se.BufferedImageLuminanceSource
-import com.google.zxing.common.HybridBinarizer
-import net.sourceforge.tess4j.Tesseract
-import java.awt.geom.AffineTransform
-import java.awt.image.BufferedImage
-import java.io.File
-import java.time.LocalDateTime
-import javax.imageio.ImageIO
+object TesseractAnalyzer {
 
-class TesseractAnalyzer(tessDataPath: String = "C:/Program Files/Tesseract-OCR/tessdata") : ImageAnalyzer {
+    fun tryParseFromOcr(
+        hardwareText: String,
+        fullText: String,
+        barcodeValue: String? = null
+    ): ParsedRecognitionResult? {
+        if (hardwareText.isBlank() && fullText.isBlank() && barcodeValue.isNullOrBlank()) return null
 
-    private val tesseract = Tesseract().apply {
-        setDatapath(tessDataPath)
-        setLanguage("rus+eng")
-        setOcrEngineMode(1)
-    }
+        val upperHardware = hardwareText.uppercase()
+        val upperFull = fullText.uppercase()
+        val combined = "$upperHardware\n$upperFull"
 
-    // Регулярные выражения терминалов Навтелеком
-    private val smartModelRegex = Regex("""SMART[\s\-_]*S[\s\-_]*(24\d{2})""", RegexOption.IGNORE_CASE)
-    private val snModelRegex = Regex("""SN[\s:]*(24\d{2})\d{4,8}""", RegexOption.IGNORE_CASE)
-    private val manufacturerRegex = Regex("""(Navtelecom|Навтелеком|Teltonika|Ruptela|Galileosky|Неоматика)""", RegexOption.IGNORE_CASE)
+        // Сжатая строка без пробелов
+        val cleanCompact = (upperHardware + " " + (barcodeValue ?: "")).replace(Regex("""[\s\-_:/\\|]"""), "")
 
-    // Поиск IMEI: штрихкод или метка в тексте
-    private val imeiLabelRegex = Regex("""(?:IMEI|ИМЕЙ|ЕМЕЙ)[\s:]*([0-9\s]{15,20})""", RegexOption.IGNORE_CASE)
-    private val strictImeiRegex = Regex("""\b\d{15}\b""")
+        // ==========================================
+        // 1. ТЕРМИНАЛ МОНИТОРИНГА (GPS / ГЛОНАСС)
+        // ==========================================
+        val isNavtelecom = combined.contains("НАВТЕЛЕКОМ") || combined.contains("NABTENEKO") ||
+                combined.contains("HAPTEЛEKOM") || combined.contains("NAVTELECOM")
 
-    // Поиск данных SIM-карты (строгие правила)
-    private val iccidRegex = Regex("""\b89\d{16,18}\b""")
-    private val phoneWithPrefixRegex = Regex("""(?:\+7|8)[\s\-]?[9]\d{2}[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}""")
+        val isTerminalMark = isNavtelecom ||
+                combined.contains("GALILEOSKY") || combined.contains("ГАЛИЛЕО") ||
+                combined.contains("TELTONIKA") || combined.contains("ARNAVI") ||
+                combined.contains("SMART") || combined.contains("CMAP") ||
+                combined.contains("S-2") || combined.contains("S.2") || combined.contains("8-2") ||
+                combined.contains("IMEI")
 
-    override fun analyze(imageFile: File): DeviceRecord {
-        val now = LocalDateTime.now()
-        val recordId = System.currentTimeMillis().toString().takeLast(6)
+        val rawImei = Regex("""\b([893]\d{14})\b""").find(hardwareText)?.groupValues?.get(1)
+            ?: Regex("""IMEI[:\s]*(\d{15})""").find(combined)?.groupValues?.get(1)
+            ?: Regex("""\b(\d{15})\b""").find(cleanCompact)?.groupValues?.get(1)
 
-        val originalImage = ImageIO.read(imageFile) ?: throw RuntimeException("Не удалось открыть изображение")
-        val barcodes = mutableSetOf<String>()
-        val textCollector = StringBuilder()
+        val imei = rawImei?.let {
+            if (it.startsWith("96")) "86" + it.substring(2) else it
+        } ?: ""
 
-        // Сканируем под 4 углами
-        for (angle in listOf(0.0, 90.0, 180.0, 270.0)) {
-            val img = if (angle == 0.0) originalImage else rotateImage(originalImage, angle)
-            barcodes.addAll(scanBarcodes(img))
+        if (imei.isNotBlank() || isTerminalMark) {
+            val explicitSn = Regex("""(?:S/N|SN|С/Н|№)[:\s]*([0-9]{4,14})""").find(combined)?.groupValues?.get(1)
+            val navtelecomSn = Regex("""\b(2[34]\d{6,10})\b""").find(hardwareText)?.groupValues?.get(1)
+            val standaloneSn = Regex("""(?m)^\s*([0-9]{8,12})\s*$""").find(hardwareText)?.groupValues?.get(1)
+                ?: Regex("""\b([0-9]{8,12})\b""").find(hardwareText)?.groupValues?.get(1)
 
-            // 1) Обычный прогон
-            try {
-                val ocr = tesseract.doOCR(img)
-                if (ocr.isNotBlank()) textCollector.append(" ").append(ocr)
-            } catch (_: Exception) {}
+            val sn = explicitSn ?: navtelecomSn ?: standaloneSn ?: ""
 
-            // 2) Прогон с повышенным контрастом (специально для точечных серых номеров SIM)
-            try {
-                val contrastImg = preprocessForDotMatrix(img)
-                val ocrContrast = tesseract.doOCR(contrastImg)
-                if (ocrContrast.isNotBlank()) textCollector.append(" ").append(ocrContrast)
-            } catch (_: Exception) {}
-        }
-
-        val fullText = (barcodes.joinToString(" ") + " " + textCollector.toString()).replace("\r", " ").trim()
-
-        // 1. Поиск ICCID (штрихкод или текст)
-        val iccidFromBarcode = barcodes.firstOrNull { it.startsWith("89") && it.length in 18..20 }
-        val iccidRegexWithSpaces = Regex("""\b89[\d\s]{16,24}\b""")
-        val iccidFromText = iccidRegexWithSpaces.find(fullText)?.let { match ->
-            val cleanDigits = match.value.filter { it.isDigit() }
-            if (cleanDigits.length in 18..20) cleanDigits else null
-        }
-        val finalIccid = iccidFromBarcode ?: iccidFromText
-
-        // 2. Исключаем ICCID из строки для чистого поиска номера телефона
-        var textWithoutIccid = fullText
-        if (finalIccid != null) {
-            textWithoutIccid = textWithoutIccid.replace(finalIccid, " ")
-        }
-        iccidRegexWithSpaces.findAll(fullText).forEach {
-            textWithoutIccid = textWithoutIccid.replace(it.value, " ")
-        }
-
-        // 3. Поиск номера телефона
-        val normalizedText = textWithoutIccid
-            .replace("O", "0")
-            .replace("o", "0")
-
-        // Вариант 1: Поиск рядом со словами "номер / Ваш номер / тел"
-        val labelRegex = Regex("""(?:номер|тел)[\s:]*([+\d\s\-]{10,25})""", RegexOption.IGNORE_CASE)
-        val phoneFromLabel = labelRegex.find(normalizedText)?.let { match ->
-            val digits = match.groupValues[1].filter { it.isDigit() }
-            when {
-                digits.length == 11 && (digits.startsWith("7") || digits.startsWith("8")) -> "+7" + digits.substring(1)
-                digits.length == 10 && digits.startsWith("9") -> "+7$digits"
-                digits.length > 11 && (digits.startsWith("79") || digits.startsWith("89")) -> "+7" + digits.substring(1, 11)
-                else -> null
+            val maker = when {
+                isNavtelecom || combined.contains("SMART") || combined.contains("CMAP") -> "Навтелеком"
+                combined.contains("GALILEOSKY") || combined.contains("ГАЛИЛЕО") -> "НПО ГалилеоСкай"
+                combined.contains("TELTONIKA") -> "Teltonika"
+                combined.contains("ARNAVI") -> "Аруснави"
+                else -> "Терминал"
             }
-        }
 
-        // Вариант 2: Ищем прямую комбинацию РФ-номера: +7 9xx... или 8 9xx... или просто 9xx xxx xx xx
-        val rawPattern = Regex("""(?:\+?7|8)?[\s\-]*(9\d{2})[\s\-]?(\d{3})[\s\-]?(\d{2})[\s\-]?(\d{2})""")
-        val phoneFromPattern = rawPattern.find(normalizedText)?.let { match ->
-            val fullDigits = match.value.filter { it.isDigit() }
-            if (fullDigits.length == 11) "+7" + fullDigits.substring(1)
-            else if (fullDigits.length == 10) "+7$fullDigits"
-            else null
-        }
+            val modelTerm = when {
+                combined.contains("2423") -> "СМАРТ S-2423"
+                combined.contains("2425") -> "СМАРТ S-2425"
+                combined.contains("2435") -> "СМАРТ S-2435"
+                combined.contains("2420") -> "СМАРТ S-2420"
+                combined.contains("2421") -> "СМАРТ S-2421"
+                combined.contains("2433") -> "СМАРТ S-2433"
+                combined.contains("2333") || combined.contains("2334") -> "СМАРТ S-2333"
+                combined.contains("FMB920") -> "Teltonika FMB920"
+                combined.contains("7X") -> "Galileosky 7x"
+                combined.contains("SMART") || combined.contains("CMAP") -> "СМАРТ S-серия"
+                else -> "Терминал GPS"
+            }
 
-        val finalPhone = phoneFromLabel ?: phoneFromPattern
-
-        // 4. Проверка условий SIM-карты
-        val hasSimKeywords = fullText.contains("SIM", ignoreCase = true) ||
-                fullText.contains("СИМ", ignoreCase = true) ||
-                fullText.contains("МегаФон", ignoreCase = true) ||
-                fullText.contains("Билайн", ignoreCase = true) ||
-                fullText.contains("МТС", ignoreCase = true) ||
-                fullText.contains("Теле2", ignoreCase = true) ||
-                fullText.contains("Ваш номер", ignoreCase = true) ||
-                fullText.contains("ICCID", ignoreCase = true)
-
-        if (finalIccid != null || (hasSimKeywords && finalPhone != null) || fullText.contains("Ваш номер", ignoreCase = true)) {
-            return DeviceRecord(
-                id = recordId,
-                timestamp = now,
-                objectType = ObjectType.SIM_CARD,
-                phoneNumber = finalPhone ?: "Не распознан",
-                iccid = finalIccid ?: "Не распознан",
-                rawText = fullText.take(200)
-            )
-        }
-
-        // 5. Проверка терминала
-        val imeiFromBarcode = barcodes.firstOrNull { it.length == 15 && it.all { c -> c.isDigit() } }
-        val snFromBarcode = barcodes.firstOrNull { it.length in 10..14 && it.startsWith("24") && it.all { c -> c.isDigit() } }
-
-        val imeiFromLabel = imeiLabelRegex.find(fullText)?.let { match ->
-            val digits = match.groupValues[1].filter { it.isDigit() }
-            if (digits.length >= 15) digits.take(15) else null
-        }
-        val imeiFromRaw = strictImeiRegex.find(fullText)?.value
-        val finalImei = imeiFromBarcode ?: imeiFromLabel ?: imeiFromRaw ?: "-"
-
-        val model: String? = snFromBarcode?.let { "SMART S-${it.take(4)}" }
-            ?: smartModelRegex.find(fullText)?.let { "SMART S-${it.groupValues[1]}" }
-            ?: snModelRegex.find(fullText)?.let { "SMART S-${it.groupValues[1]}" }
-
-        val manufacturer = manufacturerRegex.find(fullText)?.value
-            ?: if (model != null || finalImei != "-" || snFromBarcode != null) "Navtelecom" else "-"
-
-        val isTerminal = model != null || finalImei != "-" || snFromBarcode != null || fullText.contains("Navtelecom", ignoreCase = true)
-
-        if (isTerminal) {
-            return DeviceRecord(
-                id = recordId,
-                timestamp = now,
+            return ParsedRecognitionResult(
                 objectType = ObjectType.TERMINAL,
-                manufacturer = manufacturer,
-                model = model ?: "SMART S-24xx",
-                imei = finalImei,
-                rawText = fullText.take(200)
+                manufacturer = maker,
+                model = modelTerm,
+                serialNumber = sn,
+                imei = imei,
+                rawText = "$hardwareText\n$fullText"
             )
         }
 
-        // 5.5 Проверка ДУТ (ESCORT и подобные)
-        tryDetectDut(fullText)?.let { return it }
+        // ==========================================
+        // 2. КАЛИБРОВОЧНАЯ ТАБЛИЧКА ТАХОГРАФА / ТС
+        // ==========================================
+        if (combined.contains("МАСТЕРСК") || combined.contains("ТАХОГРАФ") || combined.contains("ТРАНСПОРТ") ||
+            combined.contains("КАЛИБРОВ") || combined.contains("VRN") || combined.contains("НКМ") ||
+            combined.contains("СКЗИ") || combined.contains("ПАРАМЕТР")) {
 
-        // 6. Неопределенный объект
-        return DeviceRecord(
-            id = recordId,
-            timestamp = now,
-            objectType = ObjectType.UNKNOWN,
-            rawText = fullText.take(200)
-        )
-    }
+            // 1. Поиск VIN (17 знаков)
+            // Ищем строку, начинающуюся с типичных символов российского VIN: X89, X, Z, W и т.д.
+            val vinCandidate = Regex("""(?:V[AI]N|BA[HX]|B[AI]N)?([XХZЖW][0-9A-ZА-Я]{16})""").find(cleanCompact)?.groupValues?.get(1)
+                ?: Regex("""\b([A-ZА-Я0-9]{17})\b""").find(cleanCompact)?.value ?: ""
 
-    private fun rotateImage(src: BufferedImage, angleDegrees: Double): BufferedImage {
-        val rads = Math.toRadians(angleDegrees)
-        val w = src.width
-        val h = src.height
-        val newW = if (angleDegrees == 90.0 || angleDegrees == 270.0) h else w
-        val newH = if (angleDegrees == 90.0 || angleDegrees == 270.0) w else h
-
-        val rotated = BufferedImage(newW, newH, BufferedImage.TYPE_INT_RGB)
-        val g2d = rotated.createGraphics()
-        val at = AffineTransform().apply {
-            translate((newW - w) / 2.0, (newH - h) / 2.0)
-            rotate(rads, w / 2.0, h / 2.0)
-        }
-        g2d.drawRenderedImage(src, at)
-        g2d.dispose()
-        return rotated
-    }
-
-    private fun scanBarcodes(bufferedImage: BufferedImage): List<String> {
-        val results = mutableListOf<String>()
-        try {
-            val source = BufferedImageLuminanceSource(bufferedImage)
-            val bitmap = BinaryBitmap(HybridBinarizer(source))
-            val hints = mapOf(
-                DecodeHintType.TRY_HARDER to true,
-                DecodeHintType.POSSIBLE_FORMATS to listOf(
-                    BarcodeFormat.CODE_128,
-                    BarcodeFormat.QR_CODE,
-                    BarcodeFormat.DATA_MATRIX,
-                    BarcodeFormat.EAN_13
-                )
-            )
-            val result = MultiFormatReader().apply { setHints(hints) }.decodeWithState(bitmap)
-            if (result != null) results.add(result.text)
-        } catch (_: Exception) {}
-        return results
-    }
-    private fun preprocessForDotMatrix(src: BufferedImage): BufferedImage {
-        val w = src.width
-        val h = src.height
-        val gray = BufferedImage(w, h, BufferedImage.TYPE_BYTE_GRAY)
-        val g = gray.createGraphics()
-        g.drawImage(src, 0, 0, null)
-        g.dispose()
-
-        // Увеличиваем контраст: всё, что темнее светло-серого фона, делаем темнее
-        val output = BufferedImage(w, h, BufferedImage.TYPE_BYTE_GRAY)
-        val raster = gray.raster
-        val outRaster = output.raster
-
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                val pixel = raster.getSample(x, y, 0)
-                // Растягиваем динамический диапазон для точечных серых чернил
-                val enhanced = when {
-                    pixel > 210 -> 255  // Белый фон отсекаем
-                    pixel < 120 -> 0    // Темные штрихи делаем чисто черными
-                    else -> ((pixel - 120) * (255.0 / 90.0)).toInt().coerceIn(0, 255)
+            // Нормализуем русские буквы-двойники в латиницу
+            val vin = vinCandidate.map { char ->
+                when (char) {
+                    'А' -> 'A'; 'В' -> 'B'; 'Е' -> 'E'; 'К' -> 'K'; 'М' -> 'M'
+                    'Н' -> 'H'; 'О' -> 'O'; 'Р' -> 'P'; 'С' -> 'C'; 'Т' -> 'T'; 'Х' -> 'X'
+                    else -> char
                 }
-                outRaster.setSample(x, y, 0, enhanced)
+            }.joinToString("")
+
+            // 2. Поиск госномера (VRN)
+            val explicitVrn = Regex("""VRN[:\s]*([A-ZА-Я0-9]{6,10})""").find(combined)?.groupValues?.get(1)
+            val patternVrn = Regex("""([А-ЯA-Z]\d{3}[А-ЯA-Z]{2}\d{2,3})""").find(cleanCompact)?.groupValues?.get(1)
+            val vrn = explicitVrn ?: patternVrn ?: ""
+
+            // 3. Серийный номер тахографа (C/N, C/H)
+            // Ищем после маркеров CH / CN / CE / СH в сжатой строке
+            val explicitSerial = Regex("""(?:C[HNE]|С[HNE]|SN|CH)[:\s]*([0-9A-ZА-Я]{14,18})""").find(cleanCompact)?.groupValues?.get(1)
+            // Фоллбэк: 16 hex-символов (характерно для серийников Атол Drive)
+            val hex16Serial = Regex("""\b(0[0-9A-F]{15})\b""").find(cleanCompact)?.groupValues?.get(1)
+            val serial = explicitSerial ?: hex16Serial ?: ""
+
+            // 4. Номер блока СКЗИ / НКМ
+            // Номера НКМ начинаются с кода года/партии (обычно "26" или "25") и имеют длину 14-16 символов
+            val explicitNkm = Regex("""(?:НКМ|СКЗИ|HKM|SKI|HKIM)[:\s]*([0-9A-Z]{12,20})""").find(cleanCompact)?.groupValues?.get(1)
+            val standaloneNkm = Regex("""(2[56][0-9A-Z]{12,16})""").find(cleanCompact)?.groupValues?.get(1)
+            val nkm = explicitNkm ?: standaloneNkm ?: ""
+
+            val workshop = if (combined.contains("НАВИТЕХ")) "ООО НАВИТЕХ" else "Мастерская РФ"
+            val modelTacho = when {
+                combined.contains("АТОЛ") || combined.contains("DRIVE") -> "Атол Drive"
+                combined.contains("ШТРИХ") -> "Штрих-Тахо RUS"
+                combined.contains("МЕРКУРИЙ") -> "Меркурий ТА-001"
+                combined.contains("VDO") || combined.contains("DTCO") -> "VDO DTCO"
+                else -> "Тахограф"
             }
+
+            return ParsedRecognitionResult(
+                objectType = ObjectType.TACHOGRAPH_PLATE,
+                manufacturer = workshop,
+                model = modelTacho,
+                serialNumber = serial,
+                vin = vin,
+                vrn = vrn,
+                nkm = nkm,
+                rawText = "$hardwareText\n$fullText"
+            )
         }
-        return output
+
+        // ==========================================
+        // 3. ДАТЧИК УРОВНЯ ТОПЛИВА (ДУТ)
+        // ==========================================
+        val isEscort = combined.contains("ESCORT") || combined.contains("ЭСКОРТ") ||
+                combined.contains("SEORT") || combined.contains("SCORT") || combined.contains("ESORT")
+
+        val isOmnicomm = combined.contains("OMNICOMM") || combined.contains("ОМНИКОММ") || combined.contains("LLS")
+
+        val isDutMark = isEscort || isOmnicomm ||
+                combined.contains("TD BLE") || combined.contains("TD-BLE") ||
+                combined.contains("TD-") || combined.contains("ДУТ") || combined.contains("DUT")
+
+        // 1. Серийный номер ДУТ
+        val barcodeSn = if (!barcodeValue.isNullOrBlank()) {
+            Regex("""\b(26\d{8,10})\b""").find(barcodeValue)?.groupValues?.get(1)
+        } else null
+
+        val explicitSn = Regex("""(?:S/N|SN|С/Н|№)[:\s]*([0-9]{5,14})""").find(upperHardware)?.groupValues?.get(1)
+        val escortSn = Regex("""\b(26\d{8,10})\b""").find(hardwareText)?.groupValues?.get(1)
+        val standaloneSn = Regex("""\b(\d{8,12})\b""").find(hardwareText)?.groupValues?.get(1)
+
+        val sn = barcodeSn ?: explicitSn ?: escortSn ?: standaloneSn ?: ""
+
+        // 2. MAC-адрес из штрихкода/QR (если распознан)
+        val barcodeMac = if (!barcodeValue.isNullOrBlank()) {
+            val cleanBarcode = barcodeValue.uppercase().replace(Regex("""[^0-9A-F]"""), "")
+            Regex("""([0-9A-F]{12})""").find(cleanBarcode)?.groupValues?.get(1)?.chunked(2)?.joinToString(":")
+        } else null
+
+        // 3. MAC-адрес из OCR текста:
+        // Сначала ищем полный вариант (с допуском мусорного символа спереди, например 1D9:B5...)
+        val full6Match = Regex("""(?:^|[^0-9A-F])([0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2})""")
+            .find(upperHardware)?.groupValues?.get(1)
+
+        // Вариант, когда потеряно последнее двоеточие (например, 69:B5:68:89:0A9C)
+        val missingColonMatch = if (full6Match == null) {
+            Regex("""(?:^|[^0-9A-F])([0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{4})""")
+                .find(upperHardware)?.groupValues?.get(1)?.let {
+                    it.substring(0, 11) + ":" + it.substring(11, 13) + ":" + it.substring(13, 15)
+                }
+        } else null
+
+        // Вариант с отсечением единичного мусорного символа в начале (1D9:B5:68:89:...)
+        val gluedPrefixMatch = if (full6Match == null && missingColonMatch == null) {
+            Regex("""[0-9A-Z]([0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{1,2}(?::[0-9A-F]{1,2})*)""")
+                .find(upperHardware)?.groupValues?.get(1)
+        } else null
+
+        val rawMac = full6Match ?: missingColonMatch ?: gluedPrefixMatch ?: ""
+
+        val normalizedMac = rawMac.split(":")
+            .filter { it.isNotBlank() }
+            .take(6)
+            .joinToString(":")
+
+        val textMac = if (normalizedMac.replace(":", "") == sn) "" else normalizedMac
+
+        val mac = barcodeMac ?: textMac
+
+        if (isDutMark || mac.isNotBlank() || sn.isNotBlank()) {
+            val brand = when {
+                isEscort -> "Эскорт"
+                isOmnicomm -> "Omnicomm"
+                combined.contains("ТЕХНОТОН") -> "Технотон"
+                else -> "ДУТ"
+            }
+
+            val modelDut = when {
+                combined.contains("BLE") || combined.contains("TD BLE") || combined.contains("TD-BLE") -> "Эскорт TD-BLE"
+                combined.contains("TD-150") || combined.contains("TD 150") -> "Эскорт TD-150"
+                combined.contains("TD-600") || combined.contains("TD 600") -> "Эскорт TD-600"
+                combined.contains("LLS-5") || combined.contains("LLS 5") -> "Omnicomm LLS 5"
+                combined.contains("LLS-4") || combined.contains("LLS 4") -> "Omnicomm LLS 4"
+                else -> if (isEscort) "Эскорт TD-BLE" else "ДУТ"
+            }
+
+            return ParsedRecognitionResult(
+                objectType = ObjectType.DUT,
+                manufacturer = brand,
+                model = modelDut,
+                serialNumber = sn,
+                macAddress = mac,
+                rawText = "$hardwareText\n$fullText"
+            )
+        }
+
+        // ==========================================
+        // 4. SIM-КАРТА (Проверяется только если это НЕ терминал)
+        // ==========================================
+        val isSimContext = combined.contains("ICC") || combined.contains("SIM") ||
+                combined.contains("ТЕЛЕ2") || combined.contains("T2") ||
+                combined.contains("МЕГАФОН") || combined.contains("МТС") || combined.contains("БИЛАЙН")
+
+        val barcodeIccid = if (barcodeValue != null && (barcodeValue.startsWith("89") || barcodeValue.length >= 18)) {
+            barcodeValue.filter { it.isDigit() }
+        } else null
+
+        val textIccid = Regex("""89\d{16,18}""").find(cleanCompact)?.value
+        val fallbackIccid = if (combined.contains("ICC")) {
+            val digitsAfterIcc = combined.substringAfter("ICC").take(30).filter { it.isDigit() }
+            if (digitsAfterIcc.length >= 6) {
+                if (digitsAfterIcc.startsWith("89")) digitsAfterIcc else "89$digitsAfterIcc"
+            } else null
+        } else null
+
+        val finalIccid = barcodeIccid ?: textIccid ?: fallbackIccid ?: ""
+
+        // Ищем телефон: только 10-11 цифр и ТОЛЬКО если есть контекст SIM
+        val phoneMatch = if (isSimContext) {
+            Regex("""(?:\+7|8)[\s(-]*(\d{3})[\s)-]*(\d{3})[\s-]*(\d{2})[\s-]*(\d{2})""").find(fullText.ifBlank { hardwareText })
+        } else null
+
+        val phoneNumber = phoneMatch?.let {
+            "+7${it.groupValues[1]}${it.groupValues[2]}${it.groupValues[3]}${it.groupValues[4]}"
+        } ?: ""
+
+        if (finalIccid.isNotBlank() || (isSimContext && phoneNumber.isNotBlank())) {
+            val operator = when {
+                finalIccid.startsWith("8970120") || combined.contains("ТЕЛЕ2") || combined.contains("T2") -> "Т2 (Tele2)"
+                finalIccid.startsWith("8970102") || combined.contains("МЕГАФОН") -> "МегаФон"
+                finalIccid.startsWith("8970199") || combined.contains("NEXT") -> "Next Mobile"
+                finalIccid.startsWith("8970101") || combined.contains("МТС") -> "МТС"
+                finalIccid.startsWith("8970199") || combined.contains("БИЛАЙН") -> "Билайн"
+                else -> "SIM-карта"
+            }
+
+            return ParsedRecognitionResult(
+                objectType = ObjectType.SIM_CARD,
+                manufacturer = operator,
+                model = "SIM-карта",
+                iccid = finalIccid,
+                phoneNumber = phoneNumber,
+                rawText = "$hardwareText\n$fullText"
+            )
+        }
+
+        return null
     }
-
-    // отдельный инстанс для ДУТ: латиница + режимы под гравировку
-    private val tesseractDut = Tesseract().apply {
-        setDatapath(tessDataPath)
-        setLanguage("eng")
-        setOcrEngineMode(1)
-    }
-
-    // маски ДУТ
-    private val dutMacRegex = Regex(
-        """([0-9OoIl]{2})[:.\-]([0-9OoIl]{2})[:.\-]([0-9OoIl]{2})[:.\-]([0-9OoIl]{2})[:.\-]([0-9OoIl]{2})[:.\-]([0-9OoIl]{2})"""
-    )
-    private val dutSerialRegex = Regex("""(?<![0-9OoIlA-Za-z])([0-9OoIl]{12})(?![0-9OoIl])""")
-    private val dutModelRegex = Regex("""(ESCORT[\s\-_]*)?(TD[\s\-_]*BLE)""", RegexOption.IGNORE_CASE)
-
-    private fun normalizeHex(s: String) = s
-        .replace('O', '0').replace('o', '0')
-        .replace('I', '1').replace('l', '1')
-        .replace(Regex("[.\\-]"), ":")
-
-    private fun tryDetectDut(fullText: String): DeviceRecord? {
-        val mac = dutMacRegex.find(fullText)?.value?.let(::normalizeHex)
-        val serial = dutSerialRegex.find(fullText)?.groupValues?.get(1)?.let(::normalizeHex)
-        val modelMatch = dutModelRegex.find(fullText)
-        val escortMention = fullText.contains("escort", ignoreCase = true)
-
-        val isDut = modelMatch != null || escortMention || (mac != null && serial != null)
-        if (!isDut) return null
-
-        return DeviceRecord(
-            id = System.currentTimeMillis().toString().takeLast(6),
-            timestamp = LocalDateTime.now(),
-            objectType = ObjectType.DUT,
-            manufacturer = "Escort",
-            model = "ESCORT TD BLE",   // пока фиксировано, когда появятся другие ДУТ — возьмём из modelMatch
-            imei = serial ?: "-",      // временно кладём серийник сюда, см. пункт про models.kt ниже
-            rawText = fullText.take(200),
-            dutMac = mac ?: "-"
-        )
-    }
-
 }
