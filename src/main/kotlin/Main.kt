@@ -126,10 +126,6 @@ class SensorBot(
                     userStates.remove(chatId)
                     sendReply(chatId, "База распознанных устройств очищена.")
                 }
-                text == "📊 Лимит" || text == "/limit" -> {
-                    val balanceInfo = GigaChatVisionService.getRemainingBalance()
-                    sendReply(chatId, balanceInfo)
-                }
                 else -> {
                     sendReply(chatId, "Жду фото оборудования или команду из меню.")
                 }
@@ -366,6 +362,14 @@ class SensorBot(
                 record.nkm = nkm
                 sendReply(chatId, "✅ НКМ (СКЗИ) изменен на: <code>$nkm</code>")
             }
+            EditField.WORKSHOP -> {
+                record.manufacturer = raw
+                sendReply(chatId, "✅ Мастерская изменена на: <code>$raw</code>")
+            }
+            EditField.TACHO_MODEL -> {
+                record.model = raw
+                sendReply(chatId, "✅ Модель тахографа изменена на: <code>$raw</code>")
+            }
         }
 
         // Авто-обновление сообщения с карточкой в чате
@@ -419,6 +423,13 @@ class SensorBot(
                 • НКМ (СКЗИ): <code>${escapeHtml(record.nkm)}</code>
             """.trimIndent()
 
+            ObjectType.CAMERA -> """
+                📷 <b>Определена камера видеонаблюдения:</b>
+                • Производитель: <code>${escapeHtml(record.manufacturer)}</code>
+                • Модель: <code>${escapeHtml(record.model)}</code>
+                • S/N: <code>${escapeHtml(record.serialNumber)}</code>
+            """.trimIndent()
+
             ObjectType.UNKNOWN -> """
                 ⚠️ <b>Не удалось точно классифицировать объект:</b>
                 Текст: ${escapeHtml(record.rawText.take(120))}
@@ -456,6 +467,14 @@ class SensorBot(
                     )
                 )
             }
+            ObjectType.CAMERA -> {
+                rows.add(
+                    listOf(
+                        InlineKeyboardButton("✏️ Модель").apply { callbackData = "edit_model:${record.id}" },
+                        InlineKeyboardButton("✏️ S/N").apply { callbackData = "edit_dut_sn:${record.id}" }
+                    )
+                )
+            }
             ObjectType.TERMINAL -> {
                 rows.add(
                     listOf(
@@ -465,24 +484,33 @@ class SensorBot(
                 )
             }
             ObjectType.TACHOGRAPH_PLATE -> {
+                // Ряд 1: Мастерская и Модель тахографа
+                rows.add(
+                    listOf(
+                        InlineKeyboardButton("✏️ Мастерская").apply { callbackData = "edit_workshop:${record.id}" },
+                        InlineKeyboardButton("✏️ Тахограф").apply { callbackData = "edit_tacho_model:${record.id}" }
+                    )
+                )
+                // Ряд 2: VIN и Госномер
                 rows.add(
                     listOf(
                         InlineKeyboardButton("✏️ VIN").apply { callbackData = "edit_vin:${record.id}" },
                         InlineKeyboardButton("✏️ Госномер").apply { callbackData = "edit_vrn:${record.id}" }
                     )
                 )
+                // Ряд 3: C/N и НКМ
                 rows.add(
                     listOf(
-                        InlineKeyboardButton("✏️ C/N (Тахо)").apply { callbackData = "edit_dut_sn:${record.id}" },
+                        InlineKeyboardButton("✏️ C/N (Taxo)").apply { callbackData = "edit_dut_sn:${record.id}" },
                         InlineKeyboardButton("✏️ НКМ").apply { callbackData = "edit_nkm:${record.id}" }
                     )
                 )
             }
-            else -> {
+            ObjectType.UNKNOWN -> {
                 rows.add(
                     listOf(
                         InlineKeyboardButton("✏️ Модель").apply { callbackData = "edit_model:${record.id}" },
-                        InlineKeyboardButton("✏️ ID").apply { callbackData = "edit_id:${record.id}" }
+                        InlineKeyboardButton("✏️ ID/SN").apply { callbackData = "edit_id:${record.id}" }
                     )
                 )
             }
@@ -546,7 +574,6 @@ class SensorBot(
         val reportRow = KeyboardRow()
         reportRow.add(KeyboardButton("📄 Отчет в Excel"))
         reportRow.add(KeyboardButton("🗑 Очистить базу"))
-        reportRow.add(KeyboardButton("📊 Лимит"))
         rows.add(reportRow)
 
         keyboard.keyboard = rows

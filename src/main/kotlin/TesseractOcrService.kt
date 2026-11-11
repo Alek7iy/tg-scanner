@@ -15,8 +15,8 @@ object TesseractOcrService {
     private val hardwareOcr = Tesseract().apply {
         setDatapath("C:/tessdata")
         setLanguage("eng")
-        setOcrEngineMode(1) // LSTM
-        setPageSegMode(6)   // Единый блок текста
+        setOcrEngineMode(1)
+        setPageSegMode(11) // Sparse text. Находит текст среди шума и фона
         setVariable("user_defined_dpi", "300")
         setVariable("tessedit_char_whitelist", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-:/. ")
     }

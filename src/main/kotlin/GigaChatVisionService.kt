@@ -130,46 +130,6 @@ object GigaChatVisionService {
         }
     }
 
-    /**
-     * Запрос остатка токенов аккаунта
-     */
-    fun getRemainingBalance(): String {
-        return try {
-            ensureAccessToken()
-
-            val request = Request.Builder()
-                .url(BALANCE_URL)
-                .addHeader("Authorization", "Bearer $accessToken")
-                .get()
-                .build()
-
-            client.newCall(request).execute().use { response ->
-                val body = response.body?.string() ?: ""
-                if (!response.isSuccessful) {
-                    return "Не удалось получить баланс (${response.code})"
-                }
-
-                val json = gson.fromJson(body, JsonObject::class.java)
-                val balances = json.getAsJsonArray("balance")
-
-                if (balances != null && balances.size() > 0) {
-                    val sb = StringBuilder("📊 <b>Остаток токенов GigaChat:</b>\n")
-                    for (b in balances) {
-                        val item = b.asJsonObject
-                        val usageName = item.get("usage")?.asString ?: "Пакет"
-                        val value = item.get("value")?.asLong ?: 0
-                        sb.append("• $usageName: <b>$value</b> токенов\n")
-                    }
-                    sb.toString()
-                } else {
-                    "Баланс: $body"
-                }
-            }
-        } catch (e: Exception) {
-            "Ошибка проверки лимита: ${e.message}"
-        }
-    }
-
     private fun compressImageBeforeUpload(originalFile: File, maxDimension: Int = 1400): File {
         try {
             val originalImage = ImageIO.read(originalFile) ?: return originalFile

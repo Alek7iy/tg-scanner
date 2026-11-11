@@ -8,6 +8,7 @@ enum class ObjectType(val title: String) {
     SIM_CARD("SIM-карта"),
     DUT("ДУТ"),
     TACHOGRAPH_PLATE("Калибровка тахографа / ТС"),
+    CAMERA("Камера видеонаблюдения"),
     UNKNOWN("Не определено")
 }
 

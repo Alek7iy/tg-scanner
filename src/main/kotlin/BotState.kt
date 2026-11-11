@@ -8,7 +8,9 @@ enum class EditField {
     DUT_MAC,
     VIN,
     VRN,
-    NKM
+    NKM,
+    WORKSHOP,
+    TACHO_MODEL
 }
 
 data class UserInputState(
