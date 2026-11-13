@@ -19,74 +19,25 @@ import java.io.File
 import java.time.LocalDateTime
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.collections.listOf
 
 class SensorBot(
-    private val token: String,
+    token: String,
     private val username: String
 ) : TelegramLongPollingBot(token) {
 
     private val userRecords = ConcurrentHashMap<String, MutableList<DeviceRecord>>()
     private val userStates = ConcurrentHashMap<String, UserInputState>()
 
-    // Буфер для накопления фото перед отправкой пачкой
+    // Буфер для накопления фото перед локальной обработкой пачкой
     private val photoBatchBuffer = ConcurrentHashMap<String, MutableList<File>>()
     private val MAX_PHOTOS_PER_BATCH = 6
 
+    // Буфер накопления сложных фото для распознавания через ИИ
+    private val aiFallbackQueue = ConcurrentHashMap<String, MutableList<File>>()
+    private val AI_BATCH_TRIGGER_SIZE = 6
+
     override fun getBotUsername(): String = username
-
-    private fun processSinglePhoto(chatId: String, photoFile: File) {
-        sendReply(chatId, "🔍 Сканирую фото...")
-
-        // 1. Перехват штрихкода (Code-128 / DataMatrix / QR)
-        val barcode = try {
-            val image = javax.imageio.ImageIO.read(photoFile)
-            if (image != null) BarcodeScannerService.scan(image) else null
-        } catch (e: Exception) {
-            null
-        }
-
-        // 2. Двойное сканирование (профиль железа + полный профиль)
-        val (hardwareText, fullText) = TesseractOcrService.extractTextDual(photoFile)
-
-        // 3. Анализ результата
-        val localResult = TesseractAnalyzer.tryParseFromOcr(hardwareText, fullText, barcode)
-
-        val recognitionResult: ParsedRecognitionResult = localResult ?: ParsedRecognitionResult(
-            objectType = ObjectType.UNKNOWN,
-            manufacturer = "Не определено",
-            model = "Не определено",
-            rawText = (hardwareText + "\n" + fullText).ifBlank { "Текст не распознан" }
-        )
-
-        // Формирование карточки и сохранение
-        val record = DeviceRecord(
-            id = UUID.randomUUID().toString(),
-            timestamp = LocalDateTime.now(),
-            objectType = recognitionResult.objectType,
-            manufacturer = recognitionResult.manufacturer,
-            model = recognitionResult.model,
-            serialNumber = recognitionResult.serialNumber.ifBlank { "НЕ_РАСПОЗНАН" },
-            macAddress = recognitionResult.macAddress.ifBlank { "НЕ_РАСПОЗНАН" },
-            imei = recognitionResult.imei.ifBlank { "НЕ_РАСПОЗНАН" },
-            phoneNumber = recognitionResult.phoneNumber,
-            iccid = recognitionResult.iccid,
-            vin = recognitionResult.vin.ifBlank { "НЕ_РАСПОЗНАН" },
-            vrn = recognitionResult.vrn.ifBlank { "НЕ_РАСПОЗНАН" },
-            nkm = recognitionResult.nkm.ifBlank { "НЕ_РАСПОЗНАН" },
-            rawText = recognitionResult.rawText
-        )
-
-        val userDevices = userRecords.computeIfAbsent(chatId) { mutableListOf() }
-        userDevices.add(record)
-
-        val cardText = formatRecordCard(record, userDevices.size)
-        val send = SendMessage(chatId, cardText).apply {
-            enableHtml(true)
-            replyMarkup = createCardKeyboard(record)
-        }
-        val sentMsg = execute(send)
-        record.messageId = sentMsg.messageId
-    }
 
     override fun onUpdateReceived(update: Update) {
         if (update.hasCallbackQuery()) {
@@ -109,7 +60,14 @@ class SensorBot(
             val text = message.text.trim()
             when {
                 text == "/start" -> {
-                    sendReply(chatId, "👋 <b>Бот готов к работе!</b>\n\nПрисылайте фото оборудования по одному или сразу пачкой (до 6 шт.). Как закончите загрузку — нажмите <b>«⚡ Распознать»</b>.")
+                    sendReply(
+                        chatId,
+                        "👋 <b>Бот готов к работе!</b>\n\n" +
+                                "Присылайте фото оборудования по одному или сразу пачкой (до $MAX_PHOTOS_PER_BATCH шт.).\n" +
+                                "Как закончите загрузку — нажмите <b>«⚡ Распознать»</b>.\n\n" +
+                                "Если фото окажется сложным или размытым, бот сохранит его в буфер ИИ " +
+                                "и отправит в нейросеть пачкой по $AI_BATCH_TRIGGER_SIZE шт. (или по кнопке)."
+                    )
                 }
                 text.startsWith("⚡ Распознать") -> {
                     processBatch(chatId)
@@ -118,13 +76,17 @@ class SensorBot(
                     photoBatchBuffer.remove(chatId)?.forEach { it.delete() }
                     sendReply(chatId, "🗑 Очередь загруженных фото очищена.")
                 }
+                text.startsWith("🤖 Распознать через ИИ") -> {
+                    processAiBatch(chatId)
+                }
                 text == "📄 Отчет в Excel" || text == "/report" -> {
                     sendExcelReport(chatId)
                 }
                 text == "🗑 Очистить базу" || text == "/clear" -> {
                     userRecords[chatId]?.clear()
                     userStates.remove(chatId)
-                    sendReply(chatId, "База распознанных устройств очищена.")
+                    aiFallbackQueue.remove(chatId)?.forEach { it.delete() }
+                    sendReply(chatId, "База сохраненных устройств и буфер ИИ очищены.")
                 }
                 else -> {
                     sendReply(chatId, "Жду фото оборудования или команду из меню.")
@@ -173,7 +135,7 @@ class SensorBot(
             val count = queue.size
 
             if (count == MAX_PHOTOS_PER_BATCH) {
-                sendReply(chatId, "✅ Набрано $MAX_PHOTOS_PER_BATCH фото! Начинаю обработку...")
+                sendReply(chatId, "✅ Набрано $MAX_PHOTOS_PER_BATCH фото! Начинаю локальную обработку...")
                 processBatch(chatId)
             } else {
                 sendReply(
@@ -195,7 +157,7 @@ class SensorBot(
             return
         }
 
-        sendReply(chatId, "⏳ Обрабатываю <b>${photos.size}</b> фото через Tesseract OCR...")
+        sendReply(chatId, "⏳ Обрабатываю <b>${photos.size}</b> фото локальными движками (RapidOCR + Tesseract)...")
 
         Thread {
             try {
@@ -204,10 +166,7 @@ class SensorBot(
                     if (photoFile.exists()) photoFile.delete()
                 }
 
-                sendReply(
-                    chatId,
-                    "✅ <b>Готово!</b> Все фото обработаны через локальный Tesseract (0 токенов)."
-                )
+                sendReply(chatId, "✅ Локальная обработка завершена.")
             } catch (e: Exception) {
                 e.printStackTrace()
                 sendReply(chatId, "❌ Ошибка при обработке пакета: ${e.message}")
@@ -215,11 +174,211 @@ class SensorBot(
         }.start()
     }
 
+    private fun processSinglePhoto(chatId: String, photoFile: File) {
+        // 1. Быстрый перехват штрихкодов (ZXing)
+        val barcode = try {
+            val image = javax.imageio.ImageIO.read(photoFile)
+            if (image != null) BarcodeScannerService.scan(image) else null
+        } catch (_: Exception) {
+            null
+        }
+
+        // 2. ЭТАП 1: RapidOCR (Нейросетевой локальный OCR)
+        val rapidText = RapidOcrService.extractText(photoFile)
+        val rapidResult = if (rapidText.isNotBlank()) {
+            OcrTextParser.tryParseFromOcr(rapidText, rapidText, barcode)
+        } else null
+
+        if (isCompleteResult(rapidResult)) {
+            saveAndSendCard(chatId, rapidResult!!)
+            return
+        }
+
+        // 3. ЭТАП 2: Tesseract OCR (Резервный локальный OCR)
+        val (hardwareText, fullText) = TesseractOcrService.extractTextDual(photoFile)
+
+        val combinedHardware = "$rapidText\n$hardwareText".trim()
+        val combinedFull = "$rapidText\n$fullText".trim()
+
+        val finalLocalResult = OcrTextParser.tryParseFromOcr(combinedHardware, combinedFull, barcode)
+
+        if (isCompleteResult(finalLocalResult)) {
+            saveAndSendCard(chatId, finalLocalResult!!)
+        } else {
+            // 4. ЭТАП 3: Если оба локальных движка не справились — в буфер GigaChat Vision
+            queuePhotoForAi(chatId, photoFile)
+        }
+    }
+
+    private fun isCompleteResult(result: ParsedRecognitionResult?): Boolean {
+        if (result == null || result.objectType == ObjectType.UNKNOWN) return false
+        return when (result.objectType) {
+            ObjectType.TERMINAL -> result.imei.isNotBlank() || result.serialNumber.isNotBlank()
+            ObjectType.DUT -> result.macAddress.isNotBlank() || result.serialNumber.isNotBlank()
+            ObjectType.TACHOGRAPH_PLATE -> result.vin.isNotBlank() || result.nkm.isNotBlank() || result.serialNumber.isNotBlank()
+            ObjectType.SIM_CARD -> result.iccid.isNotBlank() || result.phoneNumber.isNotBlank()
+            ObjectType.CAMERA -> result.serialNumber.isNotBlank()
+            ObjectType.VEHICLE_PLATE -> result.vrn.isNotBlank()
+            ObjectType.TACHOGRAPH_RECEIPT -> result.serialNumber.isNotBlank() || result.vin.isNotBlank()
+            else -> false
+        }
+    }
+
+    private fun queuePhotoForAi(chatId: String, photoFile: File) {
+        val queue = aiFallbackQueue.computeIfAbsent(chatId) { mutableListOf() }
+
+        val aiDir = File("ai_queue").apply { if (!exists()) mkdirs() }
+        val queuedFile = File(aiDir, "ai_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(6)}.jpg")
+        photoFile.copyTo(queuedFile, overwrite = true)
+        queue.add(queuedFile)
+
+        val count = queue.size
+
+        if (count >= AI_BATCH_TRIGGER_SIZE) {
+            sendReply(chatId, "⚡ <b>Набралось $AI_BATCH_TRIGGER_SIZE нераспознанных фото!</b>\nОтправляю пакет в нейросеть...")
+            processAiBatch(chatId)
+        } else {
+            val markup = InlineKeyboardMarkup().apply {
+                keyboard = listOf(
+                    listOf(
+                        InlineKeyboardButton("🤖 Распознать через ИИ ($count из $AI_BATCH_TRIGGER_SIZE)").apply {
+                            callbackData = "trigger_ai_batch"
+                        }
+                    )
+                )
+            }
+            val msg = SendMessage(
+                chatId,
+                "⚠️ Не удалось точно прочитать данные локально.\n" +
+                        "Фото отложено в буфер для нейросети (<b>$count из $AI_BATCH_TRIGGER_SIZE</b>).\n" +
+                        "Оно отправится автоматически при наборе $AI_BATCH_TRIGGER_SIZE шт., либо вы можете запустить анализ прямо сейчас кнопкой ниже:"
+            ).apply {
+                enableHtml(true)
+                replyMarkup = markup
+            }
+            execute(msg)
+        }
+    }
+
+    private fun processAiBatch(chatId: String) {
+        val photos = aiFallbackQueue.remove(chatId) ?: mutableListOf()
+        if (photos.isEmpty()) {
+            sendReply(chatId, "Буфер для ИИ пуст. Нет отложенных фотографий.")
+            return
+        }
+
+        sendReply(chatId, "🤖 Отправляю <b>${photos.size}</b> фото в Vision ИИ для глубокого распознавания...")
+
+        Thread {
+            try {
+                val results = mutableListOf<ParsedRecognitionResult>()
+                for (photo in photos) {
+                    try {
+                        val res = GigaChatVisionService.analyzeDevicePhoto(photo)
+                        if (res.objectType != ObjectType.UNKNOWN) {
+                            results.add(res)
+                        }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+
+                for (res in results) {
+                    saveAndSendCard(chatId, res)
+                }
+
+                photos.forEach { if (it.exists()) it.delete() }
+                sendReply(chatId, "✅ <b>Нейросеть завершила анализ!</b> Добавлено устройств: ${results.size}.")
+            } catch (e: Exception) {
+                e.printStackTrace()
+                sendReply(chatId, "❌ Ошибка при обращении к ИИ: ${e.message}\nФотографии возвращены в буфер.")
+                aiFallbackQueue.computeIfAbsent(chatId) { mutableListOf() }.addAll(photos)
+            }
+        }.start()
+    }
+
+    private fun saveAndSendCard(chatId: String, result: ParsedRecognitionResult) {
+        val records = userRecords.computeIfAbsent(chatId) { mutableListOf() }
+        val now = System.currentTimeMillis()
+        val mergeWindowMs = 2 * 60 * 1000L
+
+        if (result.objectType == ObjectType.TACHOGRAPH_RECEIPT) {
+            val recentIndex = records.indexOfLast {
+                it.objectType == ObjectType.TACHOGRAPH_RECEIPT && (now - it.createdAt) <= mergeWindowMs
+            }
+
+            if (recentIndex != -1) {
+                val merged = records[recentIndex].mergeReceipt(result)
+                records[recentIndex] = merged
+
+                val cardText = formatRecordCard(merged, records.size)
+                val msgId = merged.messageId
+                if (msgId != null) {
+                    try {
+                        val editMsg = EditMessageText().apply {
+                            this.chatId = chatId
+                            this.messageId = msgId
+                            this.text = cardText
+                            enableHtml(true)
+                            replyMarkup = createCardKeyboard(merged)
+                        }
+                        execute(editMsg)
+                        return
+                    } catch (_: Exception) {}
+                }
+
+                val sendUpdated = SendMessage(chatId, "✅ <b>Чек дополнен:</b>\n\n$cardText").apply {
+                    enableHtml(true)
+                    replyMarkup = createCardKeyboard(merged)
+                }
+                val sentMsg = execute(sendUpdated)
+                merged.messageId = sentMsg.messageId
+                return
+            }
+        }
+
+        val record = DeviceRecord(
+            id = UUID.randomUUID().toString(),
+            timestamp = LocalDateTime.now(),
+            objectType = result.objectType,
+            manufacturer = result.manufacturer,
+            model = result.model,
+            serialNumber = result.serialNumber.ifBlank { "НЕ_РАСПОЗНАН" },
+            macAddress = result.macAddress.ifBlank { "НЕ_РАСПОЗНАН" },
+            imei = result.imei.ifBlank { "НЕ_РАСПОЗНАН" },
+            phoneNumber = result.phoneNumber,
+            iccid = result.iccid,
+            vin = result.vin.ifBlank { "НЕ_РАСПОЗНАН" },
+            vrn = result.vrn.ifBlank { "НЕ_РАСПОЗНАН" },
+            nkm = result.nkm.ifBlank { "НЕ_РАСПОЗНАН" },
+            rawText = result.rawText,
+            nkmExpiry = result.nkmExpiry.ifBlank { "НЕ_РАСПОЗНАН" },
+            mileage = result.mileage.ifBlank { "НЕ_РАСПОЗНАН" },
+            calibrationInfo = result.calibrationInfo.ifBlank { "НЕ_РАСПОЗНАН" },
+            canInfo = result.canInfo.ifBlank { "НЕ_РАСПОЗНАН" }
+        )
+
+        records.add(record)
+
+        val cardText = formatRecordCard(record, records.size)
+        val send = SendMessage(chatId, cardText).apply {
+            enableHtml(true)
+            replyMarkup = createCardKeyboard(record)
+        }
+        val sentMsg = execute(send)
+        record.messageId = sentMsg.messageId
+    }
+
     private fun handleCallbackQuery(update: Update) {
         val query = update.callbackQuery
         val chatId = query.message.chatId.toString()
         val cardMessageId = query.message.messageId
         val data = query.data ?: return
+
+        if (data == "trigger_ai_batch") {
+            processAiBatch(chatId)
+            return
+        }
 
         val parts = data.split(":")
         val action = parts[0]
@@ -282,6 +441,14 @@ class SensorBot(
                 userStates[chatId] = UserInputState(recordId, EditField.NKM, cardMessageId)
                 sendCopyPrompt("Редактирование номера НКМ (СКЗИ)", record.nkm, "26G3100000231823")
             }
+            "edit_workshop" -> {
+                userStates[chatId] = UserInputState(recordId, EditField.WORKSHOP, cardMessageId)
+                sendCopyPrompt("Редактирование мастерской", record.manufacturer, "ООО НАВИТЕХ")
+            }
+            "edit_tacho_model" -> {
+                userStates[chatId] = UserInputState(recordId, EditField.TACHO_MODEL, cardMessageId)
+                sendCopyPrompt("Редактирование модели тахографа", record.model, "Атол Drive Smart")
+            }
             "delete" -> {
                 userRecords[chatId]?.remove(record)
                 sendReply(chatId, "🗑 Запись удалена из списка.")
@@ -341,7 +508,6 @@ class SensorBot(
                 sendReply(chatId, "✅ MAC-адрес изменен на: <code>$formattedMac</code>")
             }
             EditField.VIN -> {
-                // Транслитерируем русские символы в латиницу для VIN
                 val translitVin = raw.uppercase().map { char ->
                     when (char) {
                         'А' -> 'A'; 'В' -> 'B'; 'Е' -> 'E'; 'К' -> 'K'; 'М' -> 'M'
@@ -372,7 +538,7 @@ class SensorBot(
             }
         }
 
-        // Авто-обновление сообщения с карточкой в чате
+        // Авто-обновление карточки в чате
         val msgId = state.cardMessageId ?: record.messageId
         if (msgId != null) {
             try {
@@ -430,10 +596,29 @@ class SensorBot(
                 • S/N: <code>${escapeHtml(record.serialNumber)}</code>
             """.trimIndent()
 
+            ObjectType.TACHOGRAPH_RECEIPT -> """
+                🧾 <b>Чек тахографа (Техданные):</b>
+                • Мастерская: <code>${escapeHtml(record.manufacturer)}</code>
+                • Тахограф: <code>${escapeHtml(record.model)}</code> (S/N: <code>${escapeHtml(record.serialNumber)}</code>)
+                • ТС / VIN: <code>${escapeHtml(record.vrn)}</code> / <code>${escapeHtml(record.vin)}</code>
+                • Пробег: <code>${escapeHtml(record.mileage)} км</code>
+                • НКМ (СКЗИ): <code>${escapeHtml(record.nkm)}</code> (до <code>${escapeHtml(record.nkmExpiry)}</code>)
+                • Калибровка: <code>${escapeHtml(record.calibrationInfo)}</code>
+                • CAN1: <code>${escapeHtml(record.canInfo)}</code>
+            """.trimIndent()
+
             ObjectType.UNKNOWN -> """
                 ⚠️ <b>Не удалось точно классифицировать объект:</b>
                 Текст: ${escapeHtml(record.rawText.take(120))}
             """.trimIndent()
+
+            ObjectType.VEHICLE_PLATE -> """
+            🚘 <b>Определен госномер:</b>
+            • Тип: <code>${escapeHtml(record.model)}</code>
+            • Номер: <code>${escapeHtml(record.vrn)}</code>
+        """.trimIndent()
+
+
         }
 
         return "$details\n\n<i>Всего в списке: $total шт.</i>"
@@ -483,26 +668,30 @@ class SensorBot(
                     )
                 )
             }
-            ObjectType.TACHOGRAPH_PLATE -> {
-                // Ряд 1: Мастерская и Модель тахографа
+            ObjectType.TACHOGRAPH_PLATE, ObjectType.TACHOGRAPH_RECEIPT -> {
                 rows.add(
                     listOf(
                         InlineKeyboardButton("✏️ Мастерская").apply { callbackData = "edit_workshop:${record.id}" },
                         InlineKeyboardButton("✏️ Тахограф").apply { callbackData = "edit_tacho_model:${record.id}" }
                     )
                 )
-                // Ряд 2: VIN и Госномер
                 rows.add(
                     listOf(
                         InlineKeyboardButton("✏️ VIN").apply { callbackData = "edit_vin:${record.id}" },
                         InlineKeyboardButton("✏️ Госномер").apply { callbackData = "edit_vrn:${record.id}" }
                     )
                 )
-                // Ряд 3: C/N и НКМ
                 rows.add(
                     listOf(
                         InlineKeyboardButton("✏️ C/N (Taxo)").apply { callbackData = "edit_dut_sn:${record.id}" },
                         InlineKeyboardButton("✏️ НКМ").apply { callbackData = "edit_nkm:${record.id}" }
+                    )
+                )
+            }
+            ObjectType.VEHICLE_PLATE -> {
+                rows.add(
+                    listOf(
+                        InlineKeyboardButton("✏️ Госномер").apply { callbackData = "edit_vrn:${record.id}" }
                     )
                 )
             }
@@ -562,6 +751,7 @@ class SensorBot(
         keyboard.selective = true
 
         val queueSize = photoBatchBuffer[chatId]?.size ?: 0
+        val aiQueueSize = aiFallbackQueue[chatId]?.size ?: 0
         val rows = mutableListOf<KeyboardRow>()
 
         if (queueSize > 0) {
@@ -569,6 +759,12 @@ class SensorBot(
             actionRow.add(KeyboardButton("⚡ Распознать ($queueSize из $MAX_PHOTOS_PER_BATCH)"))
             actionRow.add(KeyboardButton("❌ Сбросить очередь"))
             rows.add(actionRow)
+        }
+
+        if (aiQueueSize > 0) {
+            val aiRow = KeyboardRow()
+            aiRow.add(KeyboardButton("🤖 Распознать через ИИ ($aiQueueSize из $AI_BATCH_TRIGGER_SIZE)"))
+            rows.add(aiRow)
         }
 
         val reportRow = KeyboardRow()
@@ -606,6 +802,9 @@ class SensorBot(
 fun main() {
     val botToken = "9225363619:AAEDs3vJP0YUhF31NekqoL-SFUyHFha82MA"
     val botUsername = "naviline_scanner_bot"
+
+    // Запускаем фоновый Python-сервер RapidOCR (если он настроен в проекте)
+    RapidOcrService.startServer()
 
     val botsApi = TelegramBotsApi(DefaultBotSession::class.java)
 
